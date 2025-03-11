@@ -1,0 +1,13 @@
+[package]
+name = "rseip-udp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
+bytes = "1"
+log = "0.4"
+anyhow = "1.0"
+rseip-core = { path = "../core", default-features = false, features = [
+    "cip",
+], version = "0.1" }
