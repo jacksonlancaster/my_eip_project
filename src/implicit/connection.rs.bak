@@ -1,0 +1,306 @@
+use anyhow::{Result, anyhow};
+use byteorder::{ByteOrder, LittleEndian};
+use bytes::{BytesMut, BufMut};
+use tokio::net::UdpSocket;
+use tokio::time::{interval, Duration};
+use rseip::client::ab_eip::AbEipClient;
+use rseip::cip::{MessageReply, MessageRequest};
+use rseip::precludes::MessageService;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use hex::encode;
+
+const EIP_PORT: u16 = 2222;
+const ENCAP_HEADER_SIZE: usize = 24;
+
+pub struct ImplicitClient {
+    explicit_client: Arc<Mutex<AbEipClient>>,
+    socket: Arc<UdpSocket>,
+    ip_address: String,
+}
+
+impl ImplicitClient {
+    pub async fn new(ip_address: &str) -> Result<Self> {
+        let explicit_client = AbEipClient::new_host_lookup(ip_address).await?;
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(format!("{}:{}", ip_address, EIP_PORT)).await?;
+        Ok(Self {
+            explicit_client: Arc::new(Mutex::new(explicit_client)),
+            socket: Arc::new(socket),
+            ip_address: ip_address.to_string(),
+        })
+    }
+
+    pub async fn open_connection(&mut self, rpi_ms: u32) -> Result<ImplicitConnection> {
+        let conn = ImplicitConnection::new(self, rpi_ms).await?;
+        Ok(conn)
+    }
+}
+
+pub struct ImplicitConnection {
+    socket: Arc<UdpSocket>,
+    input_data: Arc<Mutex<Vec<u8>>>,
+    output_data: Arc<Mutex<Vec<u8>>>,
+    running: Arc<Mutex<bool>>,
+    o_to_t_conn_id: u32,
+    t_to_o_conn_id: u32,
+    conn_serial_number: u16,
+    explicit_client: Arc<Mutex<AbEipClient>>,
+}
+
+
+// --- Put the hex_dump function here (outside any impl blocks) ---
+
+fn hex_dump(bytes: &[u8]) -> String {
+    bytes
+        .chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
+            let ascii: String = chunk.iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect();
+            format!("{:08X}  {:<48}  |{}|", i * 16, hex.join(" "), ascii)
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+impl ImplicitConnection {
+    // ... (your existing code here)
+}
+
+
+
+impl ImplicitConnection {
+    async fn configure(client: &Arc<Mutex<AbEipClient>>) -> Result<()> {
+        let mut data = BytesMut::with_capacity(194);
+        data.resize(194, 0); // Default config: 194 bytes of zeros
+        let path = vec![0x20, 0x04, 0x24, 0x66]; // Assembly 102, no attribute specified
+        let data_bytes = data.freeze();
+        let mr = MessageRequest::new(0x10, path, data_bytes.as_ref()); // Set Attribute Single
+        let mut client = client.lock().await;
+        let _: MessageReply<()> = match client.send::<_, &[u8], MessageReply<()>>(mr).await {
+            Ok(resp) => {
+                println!("Configuration set successfully");
+                resp
+            }
+            Err(e) => {
+                println!("Configuration failed: {:?}", e);
+                return Err(e.into());
+            }
+        };
+        Ok(())
+    }
+
+   async fn forward_open(client: &Arc<Mutex<AbEipClient>>, rpi_ms: u32) -> Result<(u32, u32)> {
+    let mut data = BytesMut::with_capacity(60);
+    data.put_u16_le(0x1234);
+    data.put_u16_le(43);
+    data.put_u32_le(0x11223344);
+    data.put_u8(3);
+    data.put_u8(0); data.put_u8(0); data.put_u8(0);
+    data.put_u32_le(0);
+    data.put_u32_le(0);
+    data.put_u16_le(0x1234);
+    data.put_u16_le(43);
+    data.put_u8(1);
+    data.put_u8(0);
+
+    let rpi_us = 10_000;
+    data.put_u32_le(rpi_us);
+    data.put_u16_le(12);
+    data.put_u16_le(0x490C);
+
+    data.put_u32_le(rpi_us);
+    data.put_u16_le(138);
+    data.put_u16_le(0x498A);
+
+    data.put_u8(1);
+
+    let data_bytes = data.freeze();
+
+    let cip_path: Vec<u8> = vec![0x20, 0x04, 0x24, 102, 0x2C, 101, 0x2C, 100];
+    println!("Adding CIP path to MessageRequest: {:?}", cip_path);
+
+    let full_packet = [data_bytes.as_ref(), cip_path.as_slice()].concat();
+
+    println!("Final Forward Open packet:\n{}", hex_dump(&full_packet));
+
+    let path: Vec<u8> = vec![0x20, 0x06, 0x24, 0x01];
+    let mr = MessageRequest::new(0x54, path.as_slice(), full_packet.as_slice());
+
+    let mut client = client.lock().await;
+    let response = match client.send::<_, &[u8], MessageReply<Vec<u8>>>(mr).await {
+        Ok(resp) => {
+            println!("Forward Open Response (Hex Dump):\n{}", hex_dump(&resp.data));
+            resp
+        },
+        Err(e) => {
+            println!("Forward Open Error: {:?}", e);
+            return Err(e.into());
+        }
+    };
+
+    if response.data.len() < 8 {
+        return Err(anyhow!("Invalid Forward Open response"));
+    }
+
+    let o_to_t_conn_id = LittleEndian::read_u32(&response.data[0..4]);
+    let t_to_o_conn_id = LittleEndian::read_u32(&response.data[4..8]);
+
+    Ok((o_to_t_conn_id, t_to_o_conn_id))
+}
+
+
+    
+    
+
+
+
+    pub async fn new(client: &ImplicitClient, rpi_ms: u32) -> Result<Self> {
+        let explicit_client = client.explicit_client.clone();
+
+        // Make sure we do NOT call configure here (commented or removed):
+        // Self::configure(&explicit_client).await?;
+
+        // Explicitly calling the fixed forward_open:
+        let (o_to_t_conn_id, t_to_o_conn_id) = Self::forward_open(&explicit_client, rpi_ms).await?;
+
+        // These sizes match exactly your working packet:
+        let input_data = Arc::new(Mutex::new(vec![0; 138]));
+        let output_data = Arc::new(Mutex::new(vec![0; 12]));
+        let running = Arc::new(Mutex::new(true));
+
+        let conn = Self {
+            socket: client.socket.clone(),
+            input_data,
+            output_data,
+            running,
+            o_to_t_conn_id,
+            t_to_o_conn_id,
+            conn_serial_number: 0x1234,
+            explicit_client,
+        };
+
+        conn.start_io_task(rpi_ms).await;
+        Ok(conn)
+    }
+    
+
+    async fn forward_close(&self) -> Result<()> {
+        let mut data = BytesMut::new();
+        data.put_u16_le(self.conn_serial_number);
+        data.put_u16_le(43); // Vendor ID (Balluff)
+        data.put_u32_le(0x11223344); // Originator Serial Number
+
+        let path = vec![0x20, 0x06, 0x24, 0x01];
+        let data_bytes = data.freeze();
+        let mr = MessageRequest::new(0x4E, path, data_bytes.as_ref());
+        let mut client = self.explicit_client.lock().await;
+        let _: MessageReply<()> = client.send(mr).await?;
+        Ok(())
+    }
+
+    fn build_encap_header(&self, command: u16, data_len: usize, sequence: u16) -> BytesMut {
+        let mut header = BytesMut::with_capacity(ENCAP_HEADER_SIZE);
+        header.put_u16_le(command);
+        header.put_u16_le(data_len as u16);
+        header.put_u32_le(0); // Session handle not needed for UDP implicit
+        header.put_u32_le(0);
+        header.put_u64_le(0);
+        header.put_u32_le(0);
+        header.put_u16_le(sequence);
+        header.put_u16_le(0);
+        header
+    }
+
+    async fn start_io_task(&self, rpi_ms: u32) {
+        let socket = self.socket.clone();
+        let input_data = self.input_data.clone();
+        let output_data = self.output_data.clone();
+        let running = self.running.clone();
+        let o_to_t_conn_id = self.o_to_t_conn_id;
+        let t_to_o_conn_id = self.t_to_o_conn_id;
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(rpi_ms as u64));
+            let mut buffer = [0u8; 512];
+            let mut sequence = 0u16;
+
+            while *running.lock().await {
+                interval.tick().await;
+
+                {
+                    let output = output_data.lock().await;
+                    let mut packet = BytesMut::new();
+                    let data_len = 6 + output.len();
+                    packet.extend_from_slice(&Self::build_encap_header_static(
+                        0x0070,
+                        data_len,
+                        sequence,
+                    ));
+                    packet.put_u32_le(o_to_t_conn_id);
+                    packet.put_u16_le(sequence);
+                    packet.extend_from_slice(&output);
+                    let _ = socket.send(&packet).await;
+                    sequence = sequence.wrapping_add(1);
+                }
+
+                if let Ok(size) = socket.recv(&mut buffer).await {
+                    if size >= ENCAP_HEADER_SIZE + 6 {
+                        let conn_id = LittleEndian::read_u32(&buffer[ENCAP_HEADER_SIZE..ENCAP_HEADER_SIZE + 4]);
+                        if conn_id == t_to_o_conn_id {
+                            let data_start = ENCAP_HEADER_SIZE + 6;
+                            let mut input = input_data.lock().await;
+                            input.clear();
+                            input.extend_from_slice(&buffer[data_start..size]);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn build_encap_header_static(command: u16, data_len: usize, sequence: u16) -> BytesMut {
+        let mut header = BytesMut::with_capacity(ENCAP_HEADER_SIZE);
+        header.put_u16_le(command);
+        header.put_u16_le(data_len as u16);
+        header.put_u32_le(0); // Session handle not needed for UDP implicit
+        header.put_u32_le(0);
+        header.put_u64_le(0);
+        header.put_u32_le(0);
+        header.put_u16_le(sequence);
+        header.put_u16_le(0);
+        header
+    }
+
+    pub async fn read_inputs(&self) -> Vec<bool> {
+        let input = self.input_data.lock().await;
+        let val = LittleEndian::read_u16(&input);
+        (0..16).map(|i| (val & (1 << i)) != 0).collect()
+    }
+
+    pub async fn write_outputs(&self, outputs: &[bool]) -> Result<()> {
+        let mut data = BytesMut::with_capacity(2);
+        let mut val = 0u16;
+        for (i, &state) in outputs.iter().take(16).enumerate() {
+            if state {
+                val |= 1 << i;
+            }
+        }
+        data.put_u16_le(val);
+
+        let mut output = self.output_data.lock().await;
+        output.clear();
+        output.extend_from_slice(&data);
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        let mut running = self.running.lock().await;
+        *running = false;
+        self.forward_close().await?;
+        Ok(())
+    }
+}

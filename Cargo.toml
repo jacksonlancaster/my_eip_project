@@ -1,12 +1,13 @@
 [package]
 name = "my_eip_project"
 version = "0.1.0"
-edition = "2024"
-
+edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-bytes = "1"
-rseip = { path = "./eip-rs-main" }
-rseip-udp = { path = "./eip-rs-main/rseip-udp" }
+byteorder = "1.4"
+bytes = "1.1"
+tokio = { version = "1.37", features = ["full", "net", "time"] }
+#rseip = { git = "https://github.com/Joylei/eip-rs.git", branch = "main" }
+rseip = { path = "../eip-rs-main" }
+hex = "0.4"
